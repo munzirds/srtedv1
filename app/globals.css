@@ -4,6 +4,23 @@
 
 @layer components {
   .btn {
-    @apply px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-sm cursor-pointer transition-colors;
+    @apply px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-sm cursor-pointer transition-colors select-none;
+  }
+
+  .drop-zone {
+    @apply flex flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-zinc-700 text-zinc-400 transition-colors cursor-pointer;
+  }
+
+  .drop-zone.drag-over {
+    @apply border-indigo-500 bg-indigo-950/30 text-indigo-300;
   }
 }
+
+/* Thin scrollbar for cue list */
+.cue-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
+}
+.cue-scroll::-webkit-scrollbar { width: 4px; }
+.cue-scroll::-webkit-scrollbar-track { background: transparent; }
+.cue-scroll::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 2px; }

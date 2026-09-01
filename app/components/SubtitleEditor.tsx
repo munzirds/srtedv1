@@ -1,10 +1,65 @@
 'use client'
 
 import { useRef, useState, useEffect, useCallback } from 'react'
-import { parseSRT, serializeSRT, getGaps, type Cue } from '@/lib/srt'
+import { parseSRT, parseVTT, serializeSRT, serializeVTT, getGaps, type Cue } from '@/lib/srt'
 
-const GAP_THRESHOLD = 1.5 // seconds of silence to skip
+const GAP_THRESHOLD = 1.5
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmt(s: number): string {
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = (s % 60).toFixed(3)
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${sec.padStart(6, '0')}`
+}
+
+function parseTimeInput(s: string): number {
+  const parts = s.split(':').map(Number)
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
+  if (parts.length === 2) return parts[0] * 60 + parts[1]
+  return parts[0]
+}
+
+function charCountColor(len: number) {
+  if (len > 80) return 'text-red-400'
+  if (len > 60) return 'text-yellow-400'
+  return 'text-zinc-600'
+}
+
+// ── Drop zone ─────────────────────────────────────────────────────────────────
+function DropZone({
+  accept,
+  label,
+  icon,
+  onFile,
+}: {
+  accept: string
+  label: string
+  icon: string
+  onFile: (f: File) => void
+}) {
+  const [over, setOver] = useState(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const handle = (f: File | undefined) => { if (f) onFile(f) }
+
+  return (
+    <div
+      className={`drop-zone h-28 w-full${over ? ' drag-over' : ''}`}
+      onClick={() => inputRef.current?.click()}
+      onDragOver={(e) => { e.preventDefault(); setOver(true) }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]) }}
+    >
+      <span className="text-3xl">{icon}</span>
+      <span className="text-sm font-medium">{label}</span>
+      <span className="text-xs text-zinc-600">or click to browse</span>
+      <input ref={inputRef} type="file" accept={accept} className="hidden" onChange={(e) => handle(e.target.files?.[0])} />
+    </div>
+  )
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 export default function SubtitleEditor() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
@@ -15,22 +70,37 @@ export default function SubtitleEditor() {
   const [activeCueId, setActiveCueId] = useState<number | null>(null)
   const [skipSilence, setSkipSilence] = useState(false)
   const [fileName, setFileName] = useState('subtitles')
+  const [fileFormat, setFileFormat] = useState<'srt' | 'vtt'>('srt')
+  const [showCues, setShowCues] = useState(false) // mobile tab toggle
+  const [timelineTooltip, setTimelineTooltip] = useState<{ x: number; time: string } | null>(null)
+  const [splitPct, setSplitPct] = useState(50)
+  const dragging = useRef(false)
+  const containerRef = useRef<HTMLDivElement>(null)
   const skipRef = useRef(skipSilence)
   skipRef.current = skipSilence
 
   // ── File loaders ──────────────────────────────────────────────────────────
-  const loadVideo = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setVideoUrl(URL.createObjectURL(file))
+  const loadVideo = (file: File) => setVideoUrl(URL.createObjectURL(file))
+
+  const loadSubtitle = (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase()
+    setFileName(file.name.replace(/\.(srt|vtt)$/i, ''))
+    setFileFormat(ext === 'vtt' ? 'vtt' : 'srt')
+    file.text().then((raw) => setCues(ext === 'vtt' ? parseVTT(raw) : parseSRT(raw)))
   }
 
-  const loadSRT = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setFileName(file.name.replace(/\.srt$/i, ''))
-    file.text().then((raw) => setCues(parseSRT(raw)))
-  }
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName
+      if (tag === 'TEXTAREA' || tag === 'INPUT') return
+      if (e.key === 'ArrowLeft') { e.preventDefault(); skipToPrev() }
+      if (e.key === 'ArrowRight') { e.preventDefault(); skipToNext() }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cues, currentTime])
 
   // ── Playback sync ─────────────────────────────────────────────────────────
   const onTimeUpdate = useCallback(() => {
@@ -38,19 +108,12 @@ export default function SubtitleEditor() {
     if (!v) return
     const t = v.currentTime
     setCurrentTime(t)
-
-    // Skip silence
     if (skipRef.current && cues.length) {
       const gaps = getGaps(cues, GAP_THRESHOLD)
       for (const g of gaps) {
-        if (t >= g.start + 0.1 && t < g.end - 0.1) {
-          v.currentTime = g.end
-          return
-        }
+        if (t >= g.start + 0.1 && t < g.end - 0.1) { v.currentTime = g.end; return }
       }
     }
-
-    // Active cue highlight
     const active = cues.find((c) => t >= c.start && t <= c.end)
     setActiveCueId(active?.id ?? null)
   }, [cues])
@@ -62,179 +125,275 @@ export default function SubtitleEditor() {
     return () => v.removeEventListener('timeupdate', onTimeUpdate)
   }, [onTimeUpdate])
 
-  // ── Timeline scroll to active cue ─────────────────────────────────────────
   useEffect(() => {
     if (activeCueId === null) return
-    const el = document.getElementById(`cue-${activeCueId}`)
-    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    document.getElementById(`cue-${activeCueId}`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
   }, [activeCueId])
 
   // ── Cue editing ───────────────────────────────────────────────────────────
-  const updateCue = (id: number, field: keyof Cue, value: string | number) => {
+  const updateCue = (id: number, field: keyof Cue, value: string | number) =>
     setCues((prev) => prev.map((c) => (c.id === id ? { ...c, [field]: value } : c)))
-  }
 
-  const seekTo = (t: number) => {
-    if (videoRef.current) videoRef.current.currentTime = t
-  }
+  const seekTo = (t: number) => { if (videoRef.current) videoRef.current.currentTime = t }
 
   const skipToNext = () => {
-    if (!cues.length) return
     const next = cues.find((c) => c.start > currentTime + 0.1)
     if (next) seekTo(next.start)
   }
 
   const skipToPrev = () => {
-    if (!cues.length) return
     const prev = [...cues].reverse().find((c) => c.start < currentTime - 0.5)
     if (prev) seekTo(prev.start)
   }
 
   // ── Export ────────────────────────────────────────────────────────────────
-  const exportSRT = () => {
-    const blob = new Blob([serializeSRT(cues)], { type: 'text/plain' })
+  const exportFile = (fmt: 'srt' | 'vtt') => {
+    const content = fmt === 'vtt' ? serializeVTT(cues) : serializeSRT(cues)
+    const blob = new Blob([content], { type: 'text/plain' })
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
-    a.download = `${fileName}.srt`
+    a.download = `${fileName}.${fmt}`
     a.click()
   }
 
-  // ── Timeline bar ──────────────────────────────────────────────────────────
+  // ── Timeline ──────────────────────────────────────────────────────────────
   const seekFromTimeline = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!duration) return
     const rect = e.currentTarget.getBoundingClientRect()
-    const ratio = (e.clientX - rect.left) / rect.width
-    seekTo(ratio * duration)
+    seekTo(((e.clientX - rect.left) / rect.width) * duration)
+  }
+
+  const onTimelineMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!duration) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const t = ((e.clientX - rect.left) / rect.width) * duration
+    setTimelineTooltip({ x: e.clientX - rect.left, time: fmt(t) })
   }
 
   const gaps = cues.length ? getGaps(cues, GAP_THRESHOLD) : []
 
+  // ── Divider drag ──────────────────────────────────────────────────────────
+  const onDividerMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault()
+    dragging.current = true
+    const onMove = (ev: MouseEvent) => {
+      if (!dragging.current || !containerRef.current) return
+      const rect = containerRef.current.getBoundingClientRect()
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100
+      setSplitPct(Math.min(Math.max(pct, 20), 80))
+    }
+    const onUp = () => { dragging.current = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  // ── Empty state ───────────────────────────────────────────────────────────
+  const isEmpty = !videoUrl && cues.length === 0
+
   return (
     <div className="flex flex-col h-screen overflow-hidden">
       {/* ── Top bar ── */}
-      <header className="flex items-center gap-3 px-4 py-2 bg-zinc-900 border-b border-zinc-800 shrink-0 flex-wrap">
-        <span className="font-bold text-lg tracking-tight text-white mr-2">SRTed</span>
+      <header className="flex items-center gap-2 px-4 py-2 bg-zinc-900 border-b border-zinc-800 shrink-0">
+        <span className="font-bold text-base tracking-tight text-white mr-1">SRTed</span>
 
-        <label className="btn">
-          📹 Video
-          <input type="file" accept="video/*" className="hidden" onChange={loadVideo} />
+        {/* File buttons — hidden on mobile when we have content */}
+        <label className="btn hidden sm:inline-flex items-center gap-1.5">
+          <VideoIcon /> Video
+          <input type="file" accept="video/*" className="hidden" onChange={(e) => e.target.files?.[0] && loadVideo(e.target.files[0])} />
         </label>
-        <label className="btn">
-          📄 SRT
-          <input type="file" accept=".srt" className="hidden" onChange={loadSRT} />
+        <label className="btn hidden sm:inline-flex items-center gap-1.5">
+          <SubIcon /> SRT / VTT
+          <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadSubtitle(e.target.files[0])} />
         </label>
 
         <div className="flex items-center gap-2 ml-auto">
-          <label className="flex items-center gap-1.5 text-sm cursor-pointer select-none">
+          <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none text-zinc-400">
             <input
               type="checkbox"
               checked={skipSilence}
               onChange={(e) => setSkipSilence(e.target.checked)}
               className="accent-indigo-500"
             />
-            Skip silence
+            <span className="hidden sm:inline">Skip silence</span>
           </label>
-          <button onClick={skipToPrev} className="btn" title="Previous cue (←)">⏮</button>
-          <button onClick={skipToNext} className="btn" title="Next cue (→)">⏭</button>
+
+          <button onClick={skipToPrev} className="btn px-2" title="Previous cue (←)">
+            <PrevIcon />
+          </button>
+          <button onClick={skipToNext} className="btn px-2" title="Next cue (→)">
+            <NextIcon />
+          </button>
+
           {cues.length > 0 && (
-            <button onClick={exportSRT} className="btn bg-indigo-600 hover:bg-indigo-500">
-              ⬇ Export SRT
+            <div className="flex items-center gap-1">
+              <button onClick={() => exportFile(fileFormat)} className="btn bg-indigo-600 hover:bg-indigo-500 flex items-center gap-1.5">
+                <DownloadIcon />
+                <span className="hidden sm:inline">Export</span>
+                <span className="uppercase text-xs opacity-70">.{fileFormat}</span>
+              </button>
+              <button
+                onClick={() => exportFile(fileFormat === 'srt' ? 'vtt' : 'srt')}
+                className="btn text-xs text-zinc-400"
+                title={`Also export as .${fileFormat === 'srt' ? 'vtt' : 'srt'}`}
+              >
+                .{fileFormat === 'srt' ? 'vtt' : 'srt'}
+              </button>
+            </div>
+          )}
+
+          {/* Mobile tab toggle */}
+          {!isEmpty && (
+            <button
+              className="btn sm:hidden px-2"
+              onClick={() => setShowCues((v) => !v)}
+              title="Toggle view"
+            >
+              {showCues ? <VideoIcon /> : <ListIcon />}
             </button>
           )}
         </div>
       </header>
 
+      {/* ── Empty state ── */}
+      {isEmpty && (
+        <div className="flex-1 flex flex-col items-center justify-center gap-6 p-8">
+          <p className="text-zinc-400 text-sm font-medium">Drop files to get started</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full max-w-lg">
+            <DropZone accept="video/*" label="Video file" icon="🎬" onFile={loadVideo} />
+            <DropZone accept=".srt,.vtt" label="SRT or VTT file" icon="💬" onFile={loadSubtitle} />
+          </div>
+          <p className="text-zinc-600 text-xs">Keyboard: Space play/pause · ← prev cue · → next cue</p>
+        </div>
+      )}
+
       {/* ── Main area ── */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* ── Left: video + timeline ── */}
-        <div className="flex flex-col w-1/2 border-r border-zinc-800 overflow-hidden">
-          {/* Video */}
-          <div className="relative bg-black flex items-center justify-center" style={{ aspectRatio: '16/9' }}>
-            {videoUrl ? (
-              <>
-                <video
-                  ref={videoRef}
-                  src={videoUrl}
-                  controls
-                  className="w-full h-full object-contain"
-                  onLoadedMetadata={() => setDuration(videoRef.current?.duration ?? 0)}
-                />
-                {/* Subtitle overlay */}
-                {activeCueId !== null && (
-                  <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
-                    <span className="bg-black/70 text-white text-sm px-3 py-1 rounded text-center max-w-[80%] whitespace-pre-wrap">
-                      {cues.find((c) => c.id === activeCueId)?.text}
-                    </span>
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="text-zinc-500 text-sm">Load a video file to begin</p>
+      {!isEmpty && (
+        <div className="flex flex-1 overflow-hidden" ref={containerRef}>
+          {/* ── Left: video + timeline (hidden on mobile when cues tab active) ── */}
+          <div
+            className={`flex flex-col ${showCues ? 'hidden' : 'flex'} sm:flex overflow-hidden`}
+            style={{ width: `${splitPct}%` }}
+          >
+            {/* Video or drop zone */}
+            <div className="relative bg-black flex items-center justify-center" style={{ aspectRatio: '16/9' }}>
+              {videoUrl ? (
+                <>
+                  <video
+                    ref={videoRef}
+                    src={videoUrl}
+                    controls
+                    className="w-full h-full object-contain"
+                    onLoadedMetadata={() => setDuration(videoRef.current?.duration ?? 0)}
+                  />
+                  {activeCueId !== null && (
+                    <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
+                      <span className="bg-black/75 text-white text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg">
+                        {cues.find((c) => c.id === activeCueId)?.text}
+                      </span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="absolute inset-0 p-4 flex items-center justify-center">
+                  <DropZone accept="video/*" label="Drop video here" icon="🎬" onFile={loadVideo} />
+                </div>
+              )}
+            </div>
+
+            {/* Mobile: load subtitle button when no cues */}
+            {cues.length === 0 && (
+              <label className="sm:hidden btn mx-3 mt-2 flex items-center justify-center gap-2">
+                <SubIcon /> Load SRT / VTT
+                <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadSubtitle(e.target.files[0])} />
+              </label>
             )}
+
+            {/* Timeline scrubber */}
+            {duration > 0 && (
+              <div className="px-3 py-2 shrink-0 border-t border-zinc-800/60">
+                <div
+                  className="relative h-8 bg-zinc-800 rounded cursor-pointer overflow-hidden"
+                  onClick={seekFromTimeline}
+                  onMouseMove={onTimelineMouseMove}
+                  onMouseLeave={() => setTimelineTooltip(null)}
+                  ref={timelineRef}
+                >
+                  {gaps.map((g, i) => (
+                    <div
+                      key={i}
+                      className="absolute top-0 h-full bg-zinc-700/50"
+                      style={{ left: `${(g.start / duration) * 100}%`, width: `${((g.end - g.start) / duration) * 100}%` }}
+                    />
+                  ))}
+                  {cues.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`absolute top-1 h-6 rounded-sm transition-colors ${c.id === activeCueId ? 'bg-indigo-400' : 'bg-indigo-700 hover:bg-indigo-500'}`}
+                      style={{ left: `${(c.start / duration) * 100}%`, width: `${Math.max(((c.end - c.start) / duration) * 100, 0.3)}%` }}
+                      onClick={(e) => { e.stopPropagation(); seekTo(c.start) }}
+                      title={c.text}
+                    />
+                  ))}
+                  <div
+                    className="absolute top-0 h-full w-0.5 bg-red-500 pointer-events-none"
+                    style={{ left: `${(currentTime / duration) * 100}%` }}
+                  />
+                  {timelineTooltip && (
+                    <div
+                      className="absolute top-0 -translate-y-full -translate-x-1/2 bg-zinc-900 border border-zinc-700 text-xs text-zinc-300 px-1.5 py-0.5 rounded pointer-events-none whitespace-nowrap"
+                      style={{ left: timelineTooltip.x }}
+                    >
+                      {timelineTooltip.time}
+                    </div>
+                  )}
+                </div>
+                <div className="flex justify-between text-xs text-zinc-500 mt-1">
+                  <span>{fmt(currentTime)}</span>
+                  <span>{cues.length} cues · {gaps.length} gaps</span>
+                  <span>{fmt(duration)}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Keyboard hint */}
+            <p className="hidden sm:block text-center text-xs text-zinc-700 pb-1">
+              Space play/pause · ← prev · → next cue
+            </p>
           </div>
 
-          {/* Timeline scrubber */}
-          {duration > 0 && (
-            <div className="px-3 py-2 shrink-0">
-              <div
-                className="relative h-8 bg-zinc-800 rounded cursor-pointer overflow-hidden"
-                onClick={seekFromTimeline}
-                ref={timelineRef}
-              >
-                {/* Silence gaps */}
-                {gaps.map((g, i) => (
-                  <div
-                    key={i}
-                    className="absolute top-0 h-full bg-zinc-700/60"
-                    style={{ left: `${(g.start / duration) * 100}%`, width: `${((g.end - g.start) / duration) * 100}%` }}
-                  />
-                ))}
-                {/* Cue blocks */}
-                {cues.map((c) => (
-                  <div
-                    key={c.id}
-                    className={`absolute top-1 h-6 rounded-sm ${c.id === activeCueId ? 'bg-indigo-400' : 'bg-indigo-700 hover:bg-indigo-600'}`}
-                    style={{ left: `${(c.start / duration) * 100}%`, width: `${Math.max(((c.end - c.start) / duration) * 100, 0.3)}%` }}
-                    onClick={(e) => { e.stopPropagation(); seekTo(c.start) }}
-                    title={c.text}
-                  />
-                ))}
-                {/* Playhead */}
-                <div
-                  className="absolute top-0 h-full w-0.5 bg-red-500 pointer-events-none"
-                  style={{ left: `${(currentTime / duration) * 100}%` }}
-                />
-              </div>
-              <div className="flex justify-between text-xs text-zinc-500 mt-0.5">
-                <span>{fmt(currentTime)}</span>
-                <span>{cues.length} cues · {gaps.length} gaps</span>
-                <span>{fmt(duration)}</span>
-              </div>
-            </div>
-          )}
-        </div>
+          {/* ── Divider ── */}
+          <div
+            className="hidden sm:flex w-1 bg-zinc-800 hover:bg-indigo-500 active:bg-indigo-400 cursor-col-resize shrink-0 transition-colors items-center justify-center group"
+            onMouseDown={onDividerMouseDown}
+          >
+            <div className="w-0.5 h-6 rounded-full bg-zinc-600 group-hover:bg-indigo-300 transition-colors" />
+          </div>
 
-        {/* ── Right: cue list editor ── */}
-        <div className="flex flex-col w-1/2 overflow-hidden">
-          {cues.length === 0 ? (
-            <div className="flex-1 flex items-center justify-center text-zinc-500 text-sm">
-              Load an SRT file to edit subtitles
-            </div>
-          ) : (
-            <div className="flex-1 overflow-y-auto divide-y divide-zinc-800">
-              {cues.map((c) => (
-                <CueRow
-                  key={c.id}
-                  cue={c}
-                  active={c.id === activeCueId}
-                  onSeek={seekTo}
-                  onChange={updateCue}
-                />
-              ))}
-            </div>
-          )}
+          {/* ── Right: cue list editor ── */}
+          <div
+            className={`${showCues ? 'flex' : 'hidden'} sm:flex flex-col overflow-hidden`}
+            style={{ width: `${100 - splitPct}%` }}
+          >
+            {cues.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center gap-4 p-6">
+                <DropZone accept=".srt,.vtt" label="Drop SRT or VTT file" icon="💬" onFile={loadSubtitle} />
+              </div>
+            ) : (
+              <div className="flex-1 overflow-y-auto divide-y divide-zinc-800/70 cue-scroll">
+                {cues.map((c) => (
+                  <CueRow
+                    key={c.id}
+                    cue={c}
+                    active={c.id === activeCueId}
+                    onSeek={seekTo}
+                    onChange={updateCue}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }
@@ -251,33 +410,46 @@ function CueRow({
   onSeek: (t: number) => void
   onChange: (id: number, field: keyof Cue, value: string | number) => void
 }) {
+  const dur = cue.end - cue.start
+  const charLen = cue.text.replace(/\n/g, '').length
+
   return (
     <div
       id={`cue-${cue.id}`}
-      className={`flex gap-2 px-3 py-2 text-sm transition-colors ${active ? 'bg-indigo-950 border-l-2 border-indigo-400' : 'hover:bg-zinc-900'}`}
+      className={`flex gap-2 px-3 py-2 text-sm transition-colors ${
+        active
+          ? 'bg-indigo-950/70 border-l-4 border-indigo-400'
+          : 'border-l-4 border-transparent hover:bg-zinc-900'
+      }`}
     >
       {/* Index + seek */}
       <button
-        className="text-zinc-500 hover:text-indigo-400 w-7 shrink-0 text-right font-mono"
+        className="text-zinc-500 hover:text-indigo-400 w-7 shrink-0 text-right font-mono pt-0.5"
         onClick={() => onSeek(cue.start)}
         title="Seek to cue"
       >
         {cue.id}
       </button>
 
-      {/* Timecodes */}
+      {/* Timecodes + duration */}
       <div className="flex flex-col gap-0.5 shrink-0 font-mono text-xs text-zinc-400">
         <TimeInput value={cue.start} onChange={(v) => onChange(cue.id, 'start', v)} />
         <TimeInput value={cue.end} onChange={(v) => onChange(cue.id, 'end', v)} />
+        <span className="text-zinc-600 tabular-nums">{dur.toFixed(2)}s</span>
       </div>
 
-      {/* Text */}
-      <textarea
-        className="flex-1 bg-transparent resize-none outline-none text-zinc-100 placeholder-zinc-600 leading-snug"
-        rows={2}
-        value={cue.text}
-        onChange={(e) => onChange(cue.id, 'text', e.target.value)}
-      />
+      {/* Text + char count */}
+      <div className="flex flex-col flex-1 gap-0.5">
+        <textarea
+          className="flex-1 bg-transparent resize-none outline-none text-zinc-100 placeholder-zinc-600 leading-snug min-h-[2.5rem]"
+          rows={2}
+          value={cue.text}
+          onChange={(e) => onChange(cue.id, 'text', e.target.value)}
+        />
+        <span className={`text-xs self-end tabular-nums ${charCountColor(charLen)}`}>
+          {charLen}
+        </span>
+      </div>
     </div>
   )
 }
@@ -286,8 +458,6 @@ function CueRow({
 function TimeInput({ value, onChange }: { value: number; onChange: (v: number) => void }) {
   const [editing, setEditing] = useState(false)
   const [raw, setRaw] = useState('')
-
-  const display = fmt(value)
 
   const commit = () => {
     setEditing(false)
@@ -307,25 +477,46 @@ function TimeInput({ value, onChange }: { value: number; onChange: (v: number) =
   ) : (
     <span
       className="cursor-pointer hover:text-indigo-300 w-28"
-      onClick={() => { setEditing(true); setRaw(display) }}
+      onClick={() => { setEditing(true); setRaw(fmt(value)) }}
     >
-      {display}
+      {fmt(value)}
     </span>
   )
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function fmt(s: number): string {
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const sec = (s % 60).toFixed(3)
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${sec.padStart(6, '0')}`
-}
+// ── Icons (inline SVG, no extra deps) ────────────────────────────────────────
+const VideoIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 10.5l4.72-2.36A1 1 0 0122 9.07v5.86a1 1 0 01-1.53.9L15.75 13.5M4 8h8.25A2.25 2.25 0 0114.5 10.25v3.5A2.25 2.25 0 0112.25 16H4a2 2 0 01-2-2v-4a2 2 0 012-2z" />
+  </svg>
+)
 
-function parseTimeInput(s: string): number {
-  // accepts HH:MM:SS.mmm or MM:SS.mmm or SS.mmm
-  const parts = s.split(':').map(Number)
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
-  if (parts.length === 2) return parts[0] * 60 + parts[1]
-  return parts[0]
-}
+const SubIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 01.865-.501 48.172 48.172 0 003.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
+  </svg>
+)
+
+const DownloadIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+  </svg>
+)
+
+const PrevIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M21 16.811c0 .864-.933 1.406-1.683.977l-7.108-4.061a1.125 1.125 0 010-1.954l7.108-4.061A1.125 1.125 0 0121 8.689v8.122zM11.25 16.811c0 .864-.933 1.406-1.683.977l-7.108-4.061a1.125 1.125 0 010-1.954l7.108-4.061a1.125 1.125 0 011.683.977v8.122z" />
+  </svg>
+)
+
+const NextIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M3 8.689c0-.864.933-1.406 1.683-.977l7.108 4.061a1.125 1.125 0 010 1.954L4.683 17.788A1.125 1.125 0 013 16.811V8.69zM12.75 8.689c0-.864.933-1.406 1.683-.977l7.108 4.061a1.125 1.125 0 010 1.954l-7.108 4.061A1.125 1.125 0 0112.75 16.811V8.69z" />
+  </svg>
+)
+
+const ListIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+  </svg>
+)
