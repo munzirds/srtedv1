@@ -24,3 +24,47 @@
 .cue-scroll::-webkit-scrollbar { width: 4px; }
 .cue-scroll::-webkit-scrollbar-track { background: transparent; }
 .cue-scroll::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 2px; }
+
+/* Light theme */
+html.light {
+  --bg-primary: #f4f4f5;
+  --bg-secondary: #e4e4e7;
+  --bg-tertiary: #d4d4d8;
+  --text-primary: #18181b;
+  --text-secondary: #3f3f46;
+  --text-muted: #71717a;
+  --border: #d4d4d8;
+}
+
+html.light body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+html.light .btn {
+  background-color: var(--bg-secondary);
+  color: var(--text-primary);
+}
+html.light .btn:hover {
+  background-color: var(--bg-tertiary);
+}
+
+html.light .drop-zone {
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+
+html.light .bg-zinc-900 { background-color: var(--bg-secondary); }
+html.light .bg-zinc-800 { background-color: var(--bg-tertiary); }
+html.light .bg-zinc-950 { background-color: var(--bg-primary); }
+html.light .border-zinc-800 { border-color: var(--border); }
+html.light .text-zinc-100 { color: var(--text-primary); }
+html.light .text-zinc-400 { color: var(--text-secondary); }
+html.light .text-zinc-500 { color: var(--text-muted); }
+html.light .text-zinc-600 { color: var(--text-muted); }
+html.light .text-zinc-700 { color: var(--text-muted); }
+html.light .text-white { color: var(--text-primary); }
+html.light .divide-zinc-800\/70 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border); }
+html.light .hover\:bg-zinc-900:hover { background-color: var(--bg-secondary); }
+html.light .cue-scroll { scrollbar-color: #a1a1aa transparent; }
+html.light .cue-scroll::-webkit-scrollbar-thumb { background: #a1a1aa; }

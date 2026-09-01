@@ -5,6 +5,20 @@ import { parseSRT, parseVTT, serializeSRT, serializeVTT, getGaps, type Cue } fro
 
 const GAP_THRESHOLD = 1.5
 
+// ── Theme hook ────────────────────────────────────────────────────────────────
+function useTheme() {
+  const [dark, setDark] = useState(true)
+  useEffect(() => {
+    setDark(!document.documentElement.classList.contains('light'))
+  }, [])
+  const toggle = () => {
+    const isLight = document.documentElement.classList.toggle('light')
+    localStorage.setItem('theme', isLight ? 'light' : 'dark')
+    setDark(!isLight)
+  }
+  return { dark, toggle }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fmt(s: number): string {
   const h = Math.floor(s / 3600)
@@ -73,11 +87,35 @@ export default function SubtitleEditor() {
   const [fileFormat, setFileFormat] = useState<'srt' | 'vtt'>('srt')
   const [timelineTooltip, setTimelineTooltip] = useState<{ x: number; time: string } | null>(null)
   const [splitPct, setSplitPct] = useState(50)
+  const [searchQuery, setSearchQuery] = useState('')
   const dragging = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const [isMobile, setIsMobile] = useState(false)
+  const wasPlayingRef = useRef(false)
   const skipRef = useRef(skipSilence)
   skipRef.current = skipSilence
+  const { dark, toggle: toggleTheme } = useTheme()
+
+  // Pause video when editing starts, resume when done
+  const onEditStart = () => {
+    const v = videoRef.current
+    if (v && !v.paused) {
+      wasPlayingRef.current = true
+      v.pause()
+    }
+  }
+  const onEditEnd = () => {
+    const v = videoRef.current
+    if (v && wasPlayingRef.current) {
+      wasPlayingRef.current = false
+      v.play()
+    }
+  }
+
+  // Filter cues by search
+  const filteredCues = searchQuery
+    ? cues.filter((c) => c.text.toLowerCase().includes(searchQuery.toLowerCase()))
+    : cues
 
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 639px)')
@@ -252,8 +290,33 @@ export default function SubtitleEditor() {
             </div>
           )}
 
+          <button onClick={toggleTheme} className="btn px-2" title="Toggle theme">
+            {dark ? <SunIcon /> : <MoonIcon />}
+          </button>
         </div>
       </header>
+
+      {/* ── Search bar (when cues loaded) ── */}
+      {cues.length > 0 && (
+        <div className="flex items-center gap-2 px-4 py-1.5 bg-zinc-900/50 border-b border-zinc-800 shrink-0">
+          <SearchIcon />
+          <input
+            type="text"
+            placeholder="Search cues..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="flex-1 bg-transparent text-sm outline-none placeholder-zinc-500"
+          />
+          {searchQuery && (
+            <span className="text-xs text-zinc-500">{filteredCues.length} / {cues.length}</span>
+          )}
+          {searchQuery && (
+            <button onClick={() => setSearchQuery('')} className="text-zinc-500 hover:text-zinc-300 p-1">
+              <CloseIcon />
+            </button>
+          )}
+        </div>
+      )}
 
       {/* ── Empty state ── */}
       {isEmpty && (
@@ -379,13 +442,15 @@ export default function SubtitleEditor() {
               </div>
             ) : (
               <div className="flex-1 overflow-y-auto divide-y divide-zinc-800/70 cue-scroll">
-                {cues.map((c) => (
+                {filteredCues.map((c) => (
                   <CueRow
                     key={c.id}
                     cue={c}
                     active={c.id === activeCueId}
                     onSeek={seekTo}
                     onChange={updateCue}
+                    onEditStart={onEditStart}
+                    onEditEnd={onEditEnd}
                   />
                 ))}
               </div>
@@ -403,11 +468,15 @@ function CueRow({
   active,
   onSeek,
   onChange,
+  onEditStart,
+  onEditEnd,
 }: {
   cue: Cue
   active: boolean
   onSeek: (t: number) => void
   onChange: (id: number, field: keyof Cue, value: string | number) => void
+  onEditStart: () => void
+  onEditEnd: () => void
 }) {
   const dur = cue.end - cue.start
   const charLen = cue.text.replace(/\n/g, '').length
@@ -415,7 +484,7 @@ function CueRow({
   return (
     <div
       id={`cue-${cue.id}`}
-      className={`flex gap-2 px-3 py-2 text-sm transition-colors ${
+      className={`flex gap-3 sm:gap-2 px-3 py-3 sm:py-2 text-sm transition-colors ${
         active
           ? 'bg-indigo-950/70 border-l-4 border-indigo-400'
           : 'border-l-4 border-transparent hover:bg-zinc-900'
@@ -423,7 +492,7 @@ function CueRow({
     >
       {/* Index + seek */}
       <button
-        className="text-zinc-500 hover:text-indigo-400 w-7 shrink-0 text-right font-mono pt-0.5"
+        className="text-zinc-500 hover:text-indigo-400 w-8 sm:w-7 shrink-0 text-right font-mono min-h-[44px] sm:min-h-0 flex items-start justify-end pt-0.5"
         onClick={() => onSeek(cue.start)}
         title="Seek to cue"
       >
@@ -431,19 +500,21 @@ function CueRow({
       </button>
 
       {/* Timecodes + duration */}
-      <div className="flex flex-col gap-0.5 shrink-0 font-mono text-xs text-zinc-400">
-        <TimeInput value={cue.start} onChange={(v) => onChange(cue.id, 'start', v)} />
-        <TimeInput value={cue.end} onChange={(v) => onChange(cue.id, 'end', v)} />
+      <div className="flex flex-col gap-1 sm:gap-0.5 shrink-0 font-mono text-xs text-zinc-400">
+        <TimeInput value={cue.start} onChange={(v) => onChange(cue.id, 'start', v)} onEditStart={onEditStart} onEditEnd={onEditEnd} />
+        <TimeInput value={cue.end} onChange={(v) => onChange(cue.id, 'end', v)} onEditStart={onEditStart} onEditEnd={onEditEnd} />
         <span className="text-zinc-600 tabular-nums">{dur.toFixed(2)}s</span>
       </div>
 
       {/* Text + char count */}
       <div className="flex flex-col flex-1 gap-0.5">
         <textarea
-          className="flex-1 bg-transparent resize-none outline-none text-zinc-100 placeholder-zinc-600 leading-snug min-h-[2.5rem]"
+          className="flex-1 bg-transparent resize-none outline-none text-zinc-100 placeholder-zinc-600 leading-snug min-h-[3rem] sm:min-h-[2.5rem] text-base sm:text-sm"
           rows={2}
           value={cue.text}
           onChange={(e) => onChange(cue.id, 'text', e.target.value)}
+          onFocus={onEditStart}
+          onBlur={onEditEnd}
         />
         <span className={`text-xs self-end tabular-nums ${charCountColor(charLen)}`}>
           {charLen}
@@ -454,20 +525,27 @@ function CueRow({
 }
 
 // ── TimeInput ─────────────────────────────────────────────────────────────────
-function TimeInput({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+function TimeInput({ value, onChange, onEditStart, onEditEnd }: { value: number; onChange: (v: number) => void; onEditStart: () => void; onEditEnd: () => void }) {
   const [editing, setEditing] = useState(false)
   const [raw, setRaw] = useState('')
+
+  const startEdit = () => {
+    setEditing(true)
+    setRaw(fmt(value))
+    onEditStart()
+  }
 
   const commit = () => {
     setEditing(false)
     const parsed = parseTimeInput(raw)
     if (!isNaN(parsed)) onChange(parsed)
+    onEditEnd()
   }
 
   return editing ? (
     <input
       autoFocus
-      className="bg-zinc-800 rounded px-1 w-28 outline-none"
+      className="bg-zinc-800 rounded px-1 w-28 outline-none min-h-[44px] sm:min-h-0"
       value={raw}
       onChange={(e) => setRaw(e.target.value)}
       onBlur={commit}
@@ -475,8 +553,8 @@ function TimeInput({ value, onChange }: { value: number; onChange: (v: number) =
     />
   ) : (
     <span
-      className="cursor-pointer hover:text-indigo-300 w-28"
-      onClick={() => { setEditing(true); setRaw(fmt(value)) }}
+      className="cursor-pointer hover:text-indigo-300 w-28 min-h-[44px] sm:min-h-0 flex items-center"
+      onClick={startEdit}
     >
       {fmt(value)}
     </span>
@@ -511,6 +589,30 @@ const PrevIcon = () => (
 const NextIcon = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" d="M3 8.689c0-.864.933-1.406 1.683-.977l7.108 4.061a1.125 1.125 0 010 1.954L4.683 17.788A1.125 1.125 0 013 16.811V8.69zM12.75 8.689c0-.864.933-1.406 1.683-.977l7.108 4.061a1.125 1.125 0 010 1.954l-7.108 4.061A1.125 1.125 0 0112.75 16.811V8.69z" />
+  </svg>
+)
+
+const SunIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" />
+  </svg>
+)
+
+const MoonIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
+  </svg>
+)
+
+const SearchIcon = () => (
+  <svg className="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+  </svg>
+)
+
+const CloseIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
   </svg>
 )
 
