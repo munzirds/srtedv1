@@ -71,13 +71,21 @@ export default function SubtitleEditor() {
   const [skipSilence, setSkipSilence] = useState(false)
   const [fileName, setFileName] = useState('subtitles')
   const [fileFormat, setFileFormat] = useState<'srt' | 'vtt'>('srt')
-  const [showCues, setShowCues] = useState(false) // mobile tab toggle
   const [timelineTooltip, setTimelineTooltip] = useState<{ x: number; time: string } | null>(null)
   const [splitPct, setSplitPct] = useState(50)
   const dragging = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
+  const [isMobile, setIsMobile] = useState(false)
   const skipRef = useRef(skipSilence)
   skipRef.current = skipSilence
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 639px)')
+    setIsMobile(mq.matches)
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches)
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
+  }, [])
 
   // ── File loaders ──────────────────────────────────────────────────────────
   const loadVideo = (file: File) => setVideoUrl(URL.createObjectURL(file))
@@ -187,6 +195,9 @@ export default function SubtitleEditor() {
     window.addEventListener('mouseup', onUp)
   }
 
+  // ── Active cue text (works for both SRT and VTT) ─────────────────────────
+  const activeCueText = activeCueId !== null ? (cues.find((c) => c.id === activeCueId)?.text ?? null) : null
+
   // ── Empty state ───────────────────────────────────────────────────────────
   const isEmpty = !videoUrl && cues.length === 0
 
@@ -241,16 +252,6 @@ export default function SubtitleEditor() {
             </div>
           )}
 
-          {/* Mobile tab toggle */}
-          {!isEmpty && (
-            <button
-              className="btn sm:hidden px-2"
-              onClick={() => setShowCues((v) => !v)}
-              title="Toggle view"
-            >
-              {showCues ? <VideoIcon /> : <ListIcon />}
-            </button>
-          )}
         </div>
       </header>
 
@@ -268,11 +269,16 @@ export default function SubtitleEditor() {
 
       {/* ── Main area ── */}
       {!isEmpty && (
-        <div className="flex flex-1 overflow-hidden" ref={containerRef}>
-          {/* ── Left: video + timeline (hidden on mobile when cues tab active) ── */}
+        // Mobile: vertical stack (video top, cues below), scrollable
+        // Desktop: horizontal split with draggable divider
+        <div
+          className="flex flex-col sm:flex-row flex-1 sm:overflow-hidden overflow-y-auto"
+          ref={containerRef}
+        >
+          {/* ── Left: video + timeline ── */}
           <div
-            className={`flex flex-col ${showCues ? 'hidden' : 'flex'} sm:flex overflow-hidden`}
-            style={{ width: `${splitPct}%` }}
+            className="flex flex-col shrink-0 sm:overflow-hidden"
+            style={{ width: isMobile ? '100%' : `${splitPct}%` }}
           >
             {/* Video or drop zone */}
             <div className="relative bg-black flex items-center justify-center" style={{ aspectRatio: '16/9' }}>
@@ -285,10 +291,10 @@ export default function SubtitleEditor() {
                     className="w-full h-full object-contain"
                     onLoadedMetadata={() => setDuration(videoRef.current?.duration ?? 0)}
                   />
-                  {activeCueId !== null && (
+                  {activeCueText !== null && (
                     <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
                       <span className="bg-black/75 text-white text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg">
-                        {cues.find((c) => c.id === activeCueId)?.text}
+                        {activeCueText}
                       </span>
                     </div>
                   )}
@@ -300,13 +306,6 @@ export default function SubtitleEditor() {
               )}
             </div>
 
-            {/* Mobile: load subtitle button when no cues */}
-            {cues.length === 0 && (
-              <label className="sm:hidden btn mx-3 mt-2 flex items-center justify-center gap-2">
-                <SubIcon /> Load SRT / VTT
-                <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadSubtitle(e.target.files[0])} />
-              </label>
-            )}
 
             {/* Timeline scrubber */}
             {duration > 0 && (
@@ -361,9 +360,9 @@ export default function SubtitleEditor() {
             </p>
           </div>
 
-          {/* ── Divider ── */}
+          {/* ── Divider (desktop only) ── */}
           <div
-            className="hidden sm:flex w-1 bg-zinc-800 hover:bg-indigo-500 active:bg-indigo-400 cursor-col-resize shrink-0 transition-colors items-center justify-center group"
+            className="hidden sm:flex w-1.5 bg-zinc-800 hover:bg-indigo-500 active:bg-indigo-400 cursor-col-resize shrink-0 transition-colors items-center justify-center group"
             onMouseDown={onDividerMouseDown}
           >
             <div className="w-0.5 h-6 rounded-full bg-zinc-600 group-hover:bg-indigo-300 transition-colors" />
@@ -371,8 +370,8 @@ export default function SubtitleEditor() {
 
           {/* ── Right: cue list editor ── */}
           <div
-            className={`${showCues ? 'flex' : 'hidden'} sm:flex flex-col overflow-hidden`}
-            style={{ width: `${100 - splitPct}%` }}
+            className="flex flex-col min-w-0 overflow-hidden sm:border-t-0 border-t border-zinc-800"
+            style={{ width: isMobile ? '100%' : `${100 - splitPct}%`, ...(isMobile ? { height: '50vh' } : {}) }}
           >
             {cues.length === 0 ? (
               <div className="flex-1 flex flex-col items-center justify-center gap-4 p-6">
@@ -515,8 +514,3 @@ const NextIcon = () => (
   </svg>
 )
 
-const ListIcon = () => (
-  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-    <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
-  </svg>
-)
