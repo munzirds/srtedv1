@@ -64,6 +64,7 @@ html.light .text-zinc-500 { color: var(--text-muted); }
 html.light .text-zinc-600 { color: var(--text-muted); }
 html.light .text-zinc-700 { color: var(--text-muted); }
 html.light .text-white { color: var(--text-primary); }
+html.light .subtitle-overlay { color: #fff !important; }
 html.light .divide-zinc-800\/70 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border); }
 html.light .hover\:bg-zinc-900:hover { background-color: var(--bg-secondary); }
 html.light .cue-scroll { scrollbar-color: #a1a1aa transparent; }

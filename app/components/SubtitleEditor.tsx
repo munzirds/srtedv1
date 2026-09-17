@@ -88,6 +88,7 @@ export default function SubtitleEditor() {
   const [timelineTooltip, setTimelineTooltip] = useState<{ x: number; time: string } | null>(null)
   const [splitPct, setSplitPct] = useState(50)
   const [searchQuery, setSearchQuery] = useState('')
+  const [showSyncPanel, setShowSyncPanel] = useState(false)
   const dragging = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const [isMobile, setIsMobile] = useState(false)
@@ -182,6 +183,15 @@ export default function SubtitleEditor() {
 
   const seekTo = (t: number) => { if (videoRef.current) videoRef.current.currentTime = t }
 
+  // Shift all cues by offset (positive = delay, negative = hasten)
+  const shiftAllCues = (offsetSec: number) => {
+    setCues((prev) => prev.map((c) => ({
+      ...c,
+      start: Math.max(0, c.start + offsetSec),
+      end: Math.max(0, c.end + offsetSec),
+    })))
+  }
+
   const skipToNext = () => {
     const next = cues.find((c) => c.start > currentTime + 0.1)
     if (next) seekTo(next.start)
@@ -275,6 +285,13 @@ export default function SubtitleEditor() {
 
           {cues.length > 0 && (
             <div className="flex items-center gap-1">
+              <button
+                onClick={() => setShowSyncPanel((v) => !v)}
+                className={`btn px-2 ${showSyncPanel ? 'bg-indigo-600' : ''}`}
+                title="Sync / time shift"
+              >
+                <SyncIcon />
+              </button>
               <button onClick={() => exportFile(fileFormat)} className="btn bg-indigo-600 hover:bg-indigo-500 flex items-center gap-1.5">
                 <DownloadIcon />
                 <span className="hidden sm:inline">Export</span>
@@ -318,6 +335,11 @@ export default function SubtitleEditor() {
         </div>
       )}
 
+      {/* ── Sync panel ── */}
+      {showSyncPanel && cues.length > 0 && (
+        <SyncPanel onShift={shiftAllCues} onClose={() => setShowSyncPanel(false)} />
+      )}
+
       {/* ── Empty state ── */}
       {isEmpty && (
         <div className="flex-1 flex flex-col items-center justify-center gap-6 p-8">
@@ -356,7 +378,7 @@ export default function SubtitleEditor() {
                   />
                   {activeCueText !== null && (
                     <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
-                      <span className="bg-black/75 text-white text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg">
+                      <span className="subtitle-overlay bg-black/75 text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fff' }}>
                         {activeCueText}
                       </span>
                     </div>
@@ -458,6 +480,46 @@ export default function SubtitleEditor() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// ── SyncPanel ───────────────────────────────────────────────────────────────
+function SyncPanel({ onShift, onClose }: { onShift: (sec: number) => void; onClose: () => void }) {
+  const [offsetInput, setOffsetInput] = useState('')
+
+  const applyCustom = () => {
+    const val = parseFloat(offsetInput)
+    if (!isNaN(val)) {
+      onShift(val)
+      setOffsetInput('')
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-4 py-2 bg-zinc-900/80 border-b border-zinc-800 shrink-0">
+      <span className="text-xs text-zinc-400 mr-1">Sync:</span>
+      <button onClick={() => onShift(-1)} className="btn text-xs px-2">-1s</button>
+      <button onClick={() => onShift(-0.5)} className="btn text-xs px-2">-0.5s</button>
+      <button onClick={() => onShift(-0.1)} className="btn text-xs px-2">-0.1s</button>
+      <button onClick={() => onShift(0.1)} className="btn text-xs px-2">+0.1s</button>
+      <button onClick={() => onShift(0.5)} className="btn text-xs px-2">+0.5s</button>
+      <button onClick={() => onShift(1)} className="btn text-xs px-2">+1s</button>
+      <div className="flex items-center gap-1 ml-2">
+        <input
+          type="text"
+          placeholder="± sec"
+          value={offsetInput}
+          onChange={(e) => setOffsetInput(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && applyCustom()}
+          className="w-16 bg-zinc-800 rounded px-2 py-1 text-xs outline-none placeholder-zinc-500"
+        />
+        <button onClick={applyCustom} className="btn text-xs px-2">Apply</button>
+      </div>
+      <span className="text-xs text-zinc-600 ml-2 hidden sm:inline">+ delay / - hasten</span>
+      <button onClick={onClose} className="ml-auto text-zinc-500 hover:text-zinc-300 p-1">
+        <CloseIcon />
+      </button>
     </div>
   )
 }
@@ -613,6 +675,12 @@ const SearchIcon = () => (
 const CloseIcon = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+  </svg>
+)
+
+const SyncIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
   </svg>
 )
 
