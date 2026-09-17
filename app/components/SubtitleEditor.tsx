@@ -89,6 +89,8 @@ export default function SubtitleEditor() {
   const [splitPct, setSplitPct] = useState(50)
   const [searchQuery, setSearchQuery] = useState('')
   const [showSyncPanel, setShowSyncPanel] = useState(false)
+  const [compareCues, setCompareCues] = useState<Cue[]>([])
+  const [showCompare, setShowCompare] = useState(false)
   const dragging = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const [isMobile, setIsMobile] = useState(false)
@@ -134,6 +136,19 @@ export default function SubtitleEditor() {
     setFileName(file.name.replace(/\.(srt|vtt)$/i, ''))
     setFileFormat(ext === 'vtt' ? 'vtt' : 'srt')
     file.text().then((raw) => setCues(ext === 'vtt' ? parseVTT(raw) : parseSRT(raw)))
+  }
+
+  const loadCompareSubtitle = (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase()
+    file.text().then((raw) => {
+      setCompareCues(ext === 'vtt' ? parseVTT(raw) : parseSRT(raw))
+      setShowCompare(true)
+    })
+  }
+
+  const clearCompare = () => {
+    setCompareCues([])
+    setShowCompare(false)
   }
 
   // ── Keyboard shortcuts ────────────────────────────────────────────────────
@@ -245,6 +260,11 @@ export default function SubtitleEditor() {
 
   // ── Active cue text (works for both SRT and VTT) ─────────────────────────
   const activeCueText = activeCueId !== null ? (cues.find((c) => c.id === activeCueId)?.text ?? null) : null
+  
+  // Active compare cue (for comparison track)
+  const activeCompareCue = showCompare && compareCues.length > 0
+    ? compareCues.find((c) => currentTime >= c.start && currentTime <= c.end)
+    : null
 
   // ── Empty state ───────────────────────────────────────────────────────────
   const isEmpty = !videoUrl && cues.length === 0
@@ -285,6 +305,18 @@ export default function SubtitleEditor() {
 
           {cues.length > 0 && (
             <div className="flex items-center gap-1">
+              <label
+                className={`btn px-2 cursor-pointer ${showCompare ? 'bg-amber-600 hover:bg-amber-500' : ''}`}
+                title="Load comparison track"
+              >
+                <CompareIcon />
+                <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadCompareSubtitle(e.target.files[0])} />
+              </label>
+              {showCompare && (
+                <button onClick={clearCompare} className="btn px-2 text-xs" title="Clear comparison">
+                  <CloseIcon />
+                </button>
+              )}
               <button
                 onClick={() => setShowSyncPanel((v) => !v)}
                 className={`btn px-2 ${showSyncPanel ? 'bg-indigo-600' : ''}`}
@@ -376,11 +408,18 @@ export default function SubtitleEditor() {
                     className="w-full h-full object-contain"
                     onLoadedMetadata={() => setDuration(videoRef.current?.duration ?? 0)}
                   />
-                  {activeCueText !== null && (
-                    <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
-                      <span className="subtitle-overlay bg-black/75 text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fff' }}>
-                        {activeCueText}
-                      </span>
+                  {(activeCueText !== null || activeCompareCue) && (
+                    <div className="absolute bottom-10 left-0 right-0 flex flex-col items-center gap-1 pointer-events-none">
+                      {activeCompareCue && (
+                        <span className="subtitle-overlay bg-amber-900/80 text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fef3c7' }}>
+                          {activeCompareCue.text}
+                        </span>
+                      )}
+                      {activeCueText !== null && (
+                        <span className="subtitle-overlay bg-black/75 text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fff' }}>
+                          {activeCueText}
+                        </span>
+                      )}
                     </div>
                   )}
                 </>
@@ -681,6 +720,12 @@ const CloseIcon = () => (
 const SyncIcon = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+  </svg>
+)
+
+const CompareIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
   </svg>
 )
 
