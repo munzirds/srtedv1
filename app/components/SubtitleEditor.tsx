@@ -3,7 +3,86 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
 import { parseSRT, parseVTT, serializeSRT, serializeVTT, getGaps, type Cue } from '@/lib/srt'
 
+// YouTube IFrame API types
+declare global {
+  interface Window { onYouTubeIframeAPIReady?: () => void }
+  namespace YT {
+    class Player {
+      constructor(id: string, opts: PlayerOptions)
+      destroy(): void
+      seekTo(seconds: number, allowSeekAhead: boolean): void
+      getCurrentTime(): number
+      getDuration(): number
+    }
+    interface PlayerOptions {
+      videoId: string
+      playerVars?: Record<string, number>
+      events?: { onReady?: (e: { target: Player }) => void }
+    }
+  }
+}
+
 const GAP_THRESHOLD = 1.5
+const STORAGE_KEY = 'srted-autosave'
+const MAX_HISTORY = 50
+const MAX_COMPARE_TRACKS = 4
+
+// Comparison track colors
+const TRACK_COLORS = [
+  { bg: 'bg-amber-900/80', text: '#fef3c7', name: 'Amber' },
+  { bg: 'bg-emerald-900/80', text: '#d1fae5', name: 'Green' },
+  { bg: 'bg-sky-900/80', text: '#e0f2fe', name: 'Blue' },
+  { bg: 'bg-pink-900/80', text: '#fce7f3', name: 'Pink' },
+]
+
+interface CompareTrack {
+  name: string
+  cues: Cue[]
+}
+
+// ── Undo/Redo hook ─────────────────────────────────────────────────────────
+function useUndoRedo<T>(initial: T) {
+  const [state, setState] = useState(initial)
+  const historyRef = useRef<T[]>([initial])
+  const indexRef = useRef(0)
+
+  const set = useCallback((val: T | ((prev: T) => T)) => {
+    setState((prev) => {
+      const next = typeof val === 'function' ? (val as (p: T) => T)(prev) : val
+      // Truncate future history and add new state
+      historyRef.current = historyRef.current.slice(0, indexRef.current + 1)
+      historyRef.current.push(next)
+      if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift()
+      else indexRef.current++
+      return next
+    })
+  }, [])
+
+  const undo = useCallback(() => {
+    if (indexRef.current > 0) {
+      indexRef.current--
+      setState(historyRef.current[indexRef.current])
+    }
+  }, [])
+
+  const redo = useCallback(() => {
+    if (indexRef.current < historyRef.current.length - 1) {
+      indexRef.current++
+      setState(historyRef.current[indexRef.current])
+    }
+  }, [])
+
+  const canUndo = indexRef.current > 0
+  const canRedo = indexRef.current < historyRef.current.length - 1
+
+  const reset = useCallback((val: T) => {
+    historyRef.current = [val]
+    indexRef.current = 0
+    setState(val)
+  }, [])
+
+  return { state, set, undo, redo, canUndo, canRedo, reset }
+}
 
 // ── Theme hook ────────────────────────────────────────────────────────────────
 function useTheme() {
@@ -76,11 +155,14 @@ function DropZone({
 // ── Main component ────────────────────────────────────────────────────────────
 export default function SubtitleEditor() {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const ytPlayerRef = useRef<YT.Player | null>(null)
+  const videoContainerRef = useRef<HTMLDivElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
+  const [ytVideoId, setYtVideoId] = useState<string | null>(null)
   const [duration, setDuration] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
-  const [cues, setCues] = useState<Cue[]>([])
+  const { state: cues, set: setCues, undo, redo, canUndo, canRedo, reset: resetCues } = useUndoRedo<Cue[]>([])
   const [activeCueId, setActiveCueId] = useState<number | null>(null)
   const [skipSilence, setSkipSilence] = useState(false)
   const [fileName, setFileName] = useState('subtitles')
@@ -89,8 +171,7 @@ export default function SubtitleEditor() {
   const [splitPct, setSplitPct] = useState(50)
   const [searchQuery, setSearchQuery] = useState('')
   const [showSyncPanel, setShowSyncPanel] = useState(false)
-  const [compareCues, setCompareCues] = useState<Cue[]>([])
-  const [showCompare, setShowCompare] = useState(false)
+  const [compareTracks, setCompareTracks] = useState<CompareTrack[]>([])
   const dragging = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const [isMobile, setIsMobile] = useState(false)
@@ -98,6 +179,27 @@ export default function SubtitleEditor() {
   const skipRef = useRef(skipSilence)
   skipRef.current = skipSilence
   const { dark, toggle: toggleTheme } = useTheme()
+
+  // Extract YouTube video ID from URL
+  const extractYtId = (url: string): string | null => {
+    const patterns = [
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([\w-]{11})/,
+      /^([\w-]{11})$/
+    ]
+    for (const p of patterns) {
+      const m = url.match(p)
+      if (m) return m[1]
+    }
+    return null
+  }
+
+  const loadYouTube = (url: string) => {
+    const id = extractYtId(url.trim())
+    if (id) {
+      setVideoUrl(null)
+      setYtVideoId(id)
+    }
+  }
 
   // Pause video when editing starts, resume when done
   const onEditStart = () => {
@@ -128,33 +230,70 @@ export default function SubtitleEditor() {
     return () => mq.removeEventListener('change', handler)
   }, [])
 
+  // ── LocalStorage auto-save ────────────────────────────────────────────
+  useEffect(() => {
+    if (cues.length > 0) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ cues, fileName, fileFormat }))
+    }
+  }, [cues, fileName, fileFormat])
+
+  // Restore from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY)
+      if (saved) {
+        const { cues: savedCues, fileName: savedName, fileFormat: savedFormat } = JSON.parse(saved)
+        if (savedCues?.length > 0) {
+          resetCues(savedCues)
+          setFileName(savedName || 'subtitles')
+          setFileFormat(savedFormat || 'srt')
+        }
+      }
+    } catch {}
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const clearAutoSave = () => localStorage.removeItem(STORAGE_KEY)
+
   // ── File loaders ──────────────────────────────────────────────────────────
-  const loadVideo = (file: File) => setVideoUrl(URL.createObjectURL(file))
+  const loadVideo = (file: File) => {
+    setYtVideoId(null)
+    setVideoUrl(URL.createObjectURL(file))
+  }
 
   const loadSubtitle = (file: File) => {
     const ext = file.name.split('.').pop()?.toLowerCase()
     setFileName(file.name.replace(/\.(srt|vtt)$/i, ''))
     setFileFormat(ext === 'vtt' ? 'vtt' : 'srt')
-    file.text().then((raw) => setCues(ext === 'vtt' ? parseVTT(raw) : parseSRT(raw)))
+    file.text().then((raw) => resetCues(ext === 'vtt' ? parseVTT(raw) : parseSRT(raw)))
   }
 
   const loadCompareSubtitle = (file: File) => {
+    if (compareTracks.length >= MAX_COMPARE_TRACKS) return
     const ext = file.name.split('.').pop()?.toLowerCase()
+    const name = file.name.replace(/\.(srt|vtt)$/i, '')
     file.text().then((raw) => {
-      setCompareCues(ext === 'vtt' ? parseVTT(raw) : parseSRT(raw))
-      setShowCompare(true)
+      const cues = ext === 'vtt' ? parseVTT(raw) : parseSRT(raw)
+      setCompareTracks((prev) => [...prev, { name, cues }])
     })
   }
 
-  const clearCompare = () => {
-    setCompareCues([])
-    setShowCompare(false)
+  const removeCompareTrack = (index: number) => {
+    setCompareTracks((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const clearAllCompareTracks = () => {
+    setCompareTracks([])
   }
 
   // ── Keyboard shortcuts ────────────────────────────────────────────────────
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName
+      // Undo/redo works everywhere
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo() }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); redo() }
+      // Other shortcuts only when not in input
       if (tag === 'TEXTAREA' || tag === 'INPUT') return
       if (e.key === 'ArrowLeft') { e.preventDefault(); skipToPrev() }
       if (e.key === 'ArrowRight') { e.preventDefault(); skipToNext() }
@@ -162,7 +301,7 @@ export default function SubtitleEditor() {
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cues, currentTime])
+  }, [cues, currentTime, undo, redo])
 
   // ── Playback sync ─────────────────────────────────────────────────────────
   const onTimeUpdate = useCallback(() => {
@@ -196,7 +335,66 @@ export default function SubtitleEditor() {
   const updateCue = (id: number, field: keyof Cue, value: string | number) =>
     setCues((prev) => prev.map((c) => (c.id === id ? { ...c, [field]: value } : c)))
 
-  const seekTo = (t: number) => { if (videoRef.current) videoRef.current.currentTime = t }
+  const seekTo = (t: number) => {
+    if (videoRef.current) videoRef.current.currentTime = t
+    else if (ytPlayerRef.current) ytPlayerRef.current.seekTo(t, true)
+  }
+
+  // YouTube IFrame API setup
+  useEffect(() => {
+    if (!ytVideoId) return
+    // Load YT API if not present
+    if (!(window as unknown as { YT?: typeof YT }).YT) {
+      const tag = document.createElement('script')
+      tag.src = 'https://www.youtube.com/iframe_api'
+      document.head.appendChild(tag)
+    }
+    const initPlayer = () => {
+      ytPlayerRef.current = new YT.Player('yt-player', {
+        videoId: ytVideoId,
+        playerVars: { autoplay: 0, modestbranding: 1, rel: 0 },
+        events: {
+          onReady: (e) => setDuration(e.target.getDuration()),
+        },
+      })
+    }
+    if ((window as unknown as { YT?: typeof YT }).YT?.Player) initPlayer()
+    else (window as unknown as { onYouTubeIframeAPIReady?: () => void }).onYouTubeIframeAPIReady = initPlayer
+    return () => { ytPlayerRef.current?.destroy(); ytPlayerRef.current = null }
+  }, [ytVideoId])
+
+  // Sync currentTime for YouTube
+  useEffect(() => {
+    if (!ytVideoId || !ytPlayerRef.current) return
+    const interval = setInterval(() => {
+      if (ytPlayerRef.current?.getCurrentTime) {
+        setCurrentTime(ytPlayerRef.current.getCurrentTime())
+      }
+    }, 250)
+    return () => clearInterval(interval)
+  }, [ytVideoId])
+
+  // Add a new cue after the specified cue (or at the end)
+  const addCue = (afterId?: number) => {
+    setCues((prev) => {
+      const maxId = prev.reduce((max, c) => Math.max(max, c.id), 0)
+      const afterIndex = afterId ? prev.findIndex((c) => c.id === afterId) : prev.length - 1
+      const afterCue = prev[afterIndex]
+      const nextCue = prev[afterIndex + 1]
+      const newStart = afterCue ? afterCue.end + 0.1 : currentTime
+      const newEnd = nextCue ? Math.min(newStart + 2, nextCue.start - 0.1) : newStart + 2
+      const newCue: Cue = { id: maxId + 1, start: newStart, end: Math.max(newEnd, newStart + 0.5), text: '' }
+      const result = [...prev]
+      result.splice(afterIndex + 1, 0, newCue)
+      // Renumber IDs
+      return result.map((c, i) => ({ ...c, id: i + 1 }))
+    })
+  }
+
+  // Delete a cue by ID
+  const deleteCue = (id: number) => {
+    setCues((prev) => prev.filter((c) => c.id !== id).map((c, i) => ({ ...c, id: i + 1 })))
+  }
 
   // Shift all cues by offset (positive = delay, negative = hasten)
   const shiftAllCues = (offsetSec: number) => {
@@ -261,13 +459,14 @@ export default function SubtitleEditor() {
   // ── Active cue text (works for both SRT and VTT) ─────────────────────────
   const activeCueText = activeCueId !== null ? (cues.find((c) => c.id === activeCueId)?.text ?? null) : null
   
-  // Active compare cue (for comparison track)
-  const activeCompareCue = showCompare && compareCues.length > 0
-    ? compareCues.find((c) => currentTime >= c.start && currentTime <= c.end)
-    : null
+  // Active compare cues (for comparison tracks)
+  const activeCompareCues = compareTracks.map((track) => ({
+    name: track.name,
+    text: track.cues.find((c) => currentTime >= c.start && currentTime <= c.end)?.text ?? null,
+  }))
 
   // ── Empty state ───────────────────────────────────────────────────────────
-  const isEmpty = !videoUrl && cues.length === 0
+  const isEmpty = !videoUrl && !ytVideoId && cues.length === 0
 
   return (
     <div className="flex flex-col h-screen overflow-hidden">
@@ -276,11 +475,35 @@ export default function SubtitleEditor() {
         <span className="font-bold text-base tracking-tight text-white mr-1">SRTed</span>
 
         {/* File buttons — hidden on mobile when we have content */}
-        <label className="btn hidden sm:inline-flex items-center gap-1.5">
+        <label className="btn h-8 hidden sm:inline-flex items-center gap-1.5">
           <VideoIcon /> Video
           <input type="file" accept="video/*" className="hidden" onChange={(e) => e.target.files?.[0] && loadVideo(e.target.files[0])} />
         </label>
-        <label className="btn hidden sm:inline-flex items-center gap-1.5">
+        <div className="hidden sm:flex items-center gap-1">
+          <input
+            type="text"
+            placeholder="YouTube URL"
+            className="h-8 px-2 text-sm bg-zinc-800 border border-zinc-700 rounded-l focus:outline-none focus:border-indigo-500 w-28 lg:w-40"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                loadYouTube((e.target as HTMLInputElement).value)
+                ;(e.target as HTMLInputElement).value = ''
+              }
+            }}
+          />
+          <button
+            className="btn h-8 px-2 rounded-l-none -ml-1"
+            title="Load YouTube video"
+            onClick={(e) => {
+              const input = (e.currentTarget.previousElementSibling as HTMLInputElement)
+              loadYouTube(input.value)
+              input.value = ''
+            }}
+          >
+            <YouTubeIcon />
+          </button>
+        </div>
+        <label className="btn h-8 hidden sm:inline-flex items-center gap-1.5">
           <SubIcon /> SRT / VTT
           <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadSubtitle(e.target.files[0])} />
         </label>
@@ -296,42 +519,56 @@ export default function SubtitleEditor() {
             <span className="hidden sm:inline">Skip silence</span>
           </label>
 
-          <button onClick={skipToPrev} className="btn px-2" title="Previous cue (←)">
+          <button onClick={skipToPrev} className="btn h-8 px-2" title="Previous cue (←)">
             <PrevIcon />
           </button>
-          <button onClick={skipToNext} className="btn px-2" title="Next cue (→)">
+          <button onClick={skipToNext} className="btn h-8 px-2" title="Next cue (→)">
             <NextIcon />
+          </button>
+
+          <button onClick={undo} disabled={!canUndo} className="btn h-8 px-2 disabled:opacity-30" title="Undo (Ctrl+Z)">
+            <UndoIcon />
+          </button>
+          <button onClick={redo} disabled={!canRedo} className="btn h-8 px-2 disabled:opacity-30" title="Redo (Ctrl+Y)">
+            <RedoIcon />
           </button>
 
           {cues.length > 0 && (
             <div className="flex items-center gap-1">
               <label
-                className={`btn px-2 cursor-pointer ${showCompare ? 'bg-amber-600 hover:bg-amber-500' : ''}`}
-                title="Load comparison track"
+                className={`btn h-8 px-2 cursor-pointer ${compareTracks.length > 0 ? 'bg-amber-600 hover:bg-amber-500' : ''} ${compareTracks.length >= MAX_COMPARE_TRACKS ? 'opacity-50 cursor-not-allowed' : ''}`}
+                title={compareTracks.length >= MAX_COMPARE_TRACKS ? 'Max 4 tracks' : 'Add comparison track'}
               >
                 <CompareIcon />
-                <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadCompareSubtitle(e.target.files[0])} />
+                {compareTracks.length > 0 && <span className="text-xs ml-1">{compareTracks.length}</span>}
+                <input 
+                  type="file" 
+                  accept=".srt,.vtt" 
+                  className="hidden" 
+                  disabled={compareTracks.length >= MAX_COMPARE_TRACKS}
+                  onChange={(e) => e.target.files?.[0] && loadCompareSubtitle(e.target.files[0])} 
+                />
               </label>
-              {showCompare && (
-                <button onClick={clearCompare} className="btn px-2 text-xs" title="Clear comparison">
+              {compareTracks.length > 0 && (
+                <button onClick={clearAllCompareTracks} className="btn h-8 px-2 text-xs" title="Clear all comparisons">
                   <CloseIcon />
                 </button>
               )}
               <button
                 onClick={() => setShowSyncPanel((v) => !v)}
-                className={`btn px-2 ${showSyncPanel ? 'bg-indigo-600' : ''}`}
+                className={`btn h-8 px-2 ${showSyncPanel ? 'bg-indigo-600' : ''}`}
                 title="Sync / time shift"
               >
                 <SyncIcon />
               </button>
-              <button onClick={() => exportFile(fileFormat)} className="btn bg-indigo-600 hover:bg-indigo-500 flex items-center gap-1.5">
+              <button onClick={() => exportFile(fileFormat)} className="btn h-8 bg-indigo-600 hover:bg-indigo-500 flex items-center gap-1.5">
                 <DownloadIcon />
                 <span className="hidden sm:inline">Export</span>
                 <span className="uppercase text-xs opacity-70">.{fileFormat}</span>
               </button>
               <button
                 onClick={() => exportFile(fileFormat === 'srt' ? 'vtt' : 'srt')}
-                className="btn text-xs text-zinc-400"
+                className="btn h-8 text-xs text-zinc-400"
                 title={`Also export as .${fileFormat === 'srt' ? 'vtt' : 'srt'}`}
               >
                 .{fileFormat === 'srt' ? 'vtt' : 'srt'}
@@ -339,7 +576,7 @@ export default function SubtitleEditor() {
             </div>
           )}
 
-          <button onClick={toggleTheme} className="btn px-2" title="Toggle theme">
+          <button onClick={toggleTheme} className="btn h-8 px-2" title="Toggle theme">
             {dark ? <SunIcon /> : <MoonIcon />}
           </button>
         </div>
@@ -372,12 +609,60 @@ export default function SubtitleEditor() {
         <SyncPanel onShift={shiftAllCues} onClose={() => setShowSyncPanel(false)} />
       )}
 
+      {/* ── Comparison legend ── */}
+      {compareTracks.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-1.5 bg-zinc-900/50 border-b border-zinc-800 shrink-0">
+          <span className="text-xs text-zinc-500">Compare:</span>
+          <div className="flex items-center gap-1 px-2 py-0.5 rounded text-xs" style={{ backgroundColor: 'rgba(0,0,0,0.5)', color: '#fff' }}>
+            <span className="w-2 h-2 rounded-full bg-white"></span>
+            <span className="truncate max-w-[100px]">{fileName}</span>
+            <span className="text-zinc-500">(editing)</span>
+          </div>
+          {compareTracks.map((track, i) => (
+            <div 
+              key={i} 
+              className="flex items-center gap-1 px-2 py-0.5 rounded text-xs group"
+              style={{ backgroundColor: TRACK_COLORS[i].bg.replace('/80', '').replace('bg-', ''), color: TRACK_COLORS[i].text }}
+            >
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: TRACK_COLORS[i].text }}></span>
+              <span className="truncate max-w-[100px]">{track.name}</span>
+              <button 
+                onClick={() => removeCompareTrack(i)} 
+                className="opacity-50 hover:opacity-100 ml-1"
+                title="Remove track"
+              >
+                <CloseIcon />
+              </button>
+            </div>
+          ))}
+          {compareTracks.length < MAX_COMPARE_TRACKS && (
+            <label className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer flex items-center gap-1">
+              <PlusIcon /> Add
+              <input type="file" accept=".srt,.vtt" className="hidden" onChange={(e) => e.target.files?.[0] && loadCompareSubtitle(e.target.files[0])} />
+            </label>
+          )}
+        </div>
+      )}
+
       {/* ── Empty state ── */}
       {isEmpty && (
         <div className="flex-1 flex flex-col items-center justify-center gap-6 p-8">
-          <p className="text-zinc-400 text-sm font-medium">Drop files to get started</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full max-w-lg">
+          <p className="text-zinc-400 text-sm font-medium">Drop files or paste a YouTube URL to get started</p>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 w-full max-w-2xl">
             <DropZone accept="video/*" label="Video file" icon="🎬" onFile={loadVideo} />
+            <div className="drop-zone h-28 w-full flex flex-col items-center justify-center gap-2 p-4">
+              <YouTubeIcon />
+              <input
+                type="text"
+                placeholder="Paste YouTube URL"
+                className="w-full px-2 py-1 text-sm bg-zinc-800 border border-zinc-700 rounded focus:outline-none focus:border-indigo-500 text-center"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    loadYouTube((e.target as HTMLInputElement).value)
+                  }
+                }}
+              />
+            </div>
             <DropZone accept=".srt,.vtt" label="SRT or VTT file" icon="💬" onFile={loadSubtitle} />
           </div>
           <p className="text-zinc-600 text-xs">Keyboard: Space play/pause · ← prev cue · → next cue</p>
@@ -398,7 +683,16 @@ export default function SubtitleEditor() {
             style={{ width: isMobile ? '100%' : `${splitPct}%` }}
           >
             {/* Video or drop zone */}
-            <div className="relative bg-black flex items-center justify-center" style={{ aspectRatio: '16/9' }}>
+            <div 
+              ref={videoContainerRef}
+              className="relative bg-black flex items-center justify-center group/video" 
+              style={{ aspectRatio: '16/9' }}
+              onDoubleClick={() => {
+                if (!videoContainerRef.current || ytVideoId) return
+                if (document.fullscreenElement) document.exitFullscreen()
+                else videoContainerRef.current.requestFullscreen()
+              }}
+            >
               {videoUrl ? (
                 <>
                   <video
@@ -408,15 +702,41 @@ export default function SubtitleEditor() {
                     className="w-full h-full object-contain"
                     onLoadedMetadata={() => setDuration(videoRef.current?.duration ?? 0)}
                   />
-                  {(activeCueText !== null || activeCompareCue) && (
-                    <div className="absolute bottom-10 left-0 right-0 flex flex-col items-center gap-1 pointer-events-none">
-                      {activeCompareCue && (
-                        <span className="subtitle-overlay bg-amber-900/80 text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fef3c7' }}>
-                          {activeCompareCue.text}
+                  {(activeCueText !== null || activeCompareCues.some(c => c.text)) && (
+                    <div className="absolute bottom-12 sm:bottom-16 left-0 right-0 flex flex-col items-center gap-1 pointer-events-none z-10">
+                      {activeCompareCues.map((cue, i) => cue.text && (
+                        <span 
+                          key={i} 
+                          className={`subtitle-overlay ${TRACK_COLORS[i].bg} text-sm sm:text-base md:text-lg px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg`} 
+                          style={{ color: TRACK_COLORS[i].text }}
+                        >
+                          {cue.text}
+                        </span>
+                      ))}
+                      {activeCueText !== null && (
+                        <span className="subtitle-overlay bg-black/75 text-sm sm:text-base md:text-lg px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fff' }}>
+                          {activeCueText}
                         </span>
                       )}
+                    </div>
+                  )}
+                </>
+              ) : ytVideoId ? (
+                <>
+                  <div id="yt-player" className="w-full h-full" />
+                  {(activeCueText !== null || activeCompareCues.some(c => c.text)) && (
+                    <div className="absolute bottom-2 left-0 right-0 flex flex-col items-center gap-1 pointer-events-none z-10">
+                      {activeCompareCues.map((cue, i) => cue.text && (
+                        <span 
+                          key={i} 
+                          className={`subtitle-overlay ${TRACK_COLORS[i].bg} text-sm sm:text-base md:text-lg px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg`} 
+                          style={{ color: TRACK_COLORS[i].text }}
+                        >
+                          {cue.text}
+                        </span>
+                      ))}
                       {activeCueText !== null && (
-                        <span className="subtitle-overlay bg-black/75 text-sm px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fff' }}>
+                        <span className="subtitle-overlay bg-black/75 text-sm sm:text-base md:text-lg px-3 py-1 rounded-md text-center max-w-[80%] whitespace-pre-wrap leading-snug shadow-lg" style={{ color: '#fff' }}>
                           {activeCueText}
                         </span>
                       )}
@@ -512,8 +832,16 @@ export default function SubtitleEditor() {
                     onChange={updateCue}
                     onEditStart={onEditStart}
                     onEditEnd={onEditEnd}
+                    onAdd={() => addCue(c.id)}
+                    onDelete={() => deleteCue(c.id)}
                   />
                 ))}
+                <button
+                  onClick={() => addCue()}
+                  className="w-full py-3 text-sm text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 transition-colors flex items-center justify-center gap-2"
+                >
+                  <PlusIcon /> Add cue
+                </button>
               </div>
             )}
           </div>
@@ -571,6 +899,8 @@ function CueRow({
   onChange,
   onEditStart,
   onEditEnd,
+  onAdd,
+  onDelete,
 }: {
   cue: Cue
   active: boolean
@@ -578,6 +908,8 @@ function CueRow({
   onChange: (id: number, field: keyof Cue, value: string | number) => void
   onEditStart: () => void
   onEditEnd: () => void
+  onAdd: () => void
+  onDelete: () => void
 }) {
   const dur = cue.end - cue.start
   const charLen = cue.text.replace(/\n/g, '').length
@@ -585,7 +917,7 @@ function CueRow({
   return (
     <div
       id={`cue-${cue.id}`}
-      className={`flex gap-3 sm:gap-2 px-3 py-3 sm:py-2 text-sm transition-colors ${
+      className={`group flex gap-3 sm:gap-2 px-3 py-3 sm:py-2 text-sm transition-colors ${
         active
           ? 'bg-indigo-950/70 border-l-4 border-indigo-400'
           : 'border-l-4 border-transparent hover:bg-zinc-900'
@@ -620,6 +952,16 @@ function CueRow({
         <span className={`text-xs self-end tabular-nums ${charCountColor(charLen)}`}>
           {charLen}
         </span>
+      </div>
+
+      {/* Actions */}
+      <div className="flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button onClick={onAdd} className="p-1 text-zinc-600 hover:text-green-400" title="Add cue after">
+          <PlusIcon />
+        </button>
+        <button onClick={onDelete} className="p-1 text-zinc-600 hover:text-red-400" title="Delete cue">
+          <TrashIcon />
+        </button>
       </div>
     </div>
   )
@@ -666,6 +1008,12 @@ function TimeInput({ value, onChange, onEditStart, onEditEnd }: { value: number;
 const VideoIcon = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 10.5l4.72-2.36A1 1 0 0122 9.07v5.86a1 1 0 01-1.53.9L15.75 13.5M4 8h8.25A2.25 2.25 0 0114.5 10.25v3.5A2.25 2.25 0 0112.25 16H4a2 2 0 01-2-2v-4a2 2 0 012-2z" />
+  </svg>
+)
+
+const YouTubeIcon = () => (
+  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+    <path d="M23.5 6.2a3 3 0 00-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 00.5 6.2 31.5 31.5 0 000 12a31.5 31.5 0 00.5 5.8 3 3 0 002.1 2.1c1.9.6 9.4.6 9.4.6s7.5 0 9.4-.6a3 3 0 002.1-2.1c.4-1.9.5-5.8.5-5.8s0-3.9-.5-5.8zM9.5 15.5v-7l6.3 3.5-6.3 3.5z" />
   </svg>
 )
 
@@ -726,6 +1074,30 @@ const SyncIcon = () => (
 const CompareIcon = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
+  </svg>
+)
+
+const UndoIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
+  </svg>
+)
+
+const RedoIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M15 15l6-6m0 0l-6-6m6 6H9a6 6 0 000 12h3" />
+  </svg>
+)
+
+const PlusIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+  </svg>
+)
+
+const TrashIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
   </svg>
 )
 

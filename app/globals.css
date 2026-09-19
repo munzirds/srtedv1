@@ -69,3 +69,16 @@ html.light .divide-zinc-800\/70 > :not([hidden]) ~ :not([hidden]) { border-color
 html.light .hover\:bg-zinc-900:hover { background-color: var(--bg-secondary); }
 html.light .cue-scroll { scrollbar-color: #a1a1aa transparent; }
 html.light .cue-scroll::-webkit-scrollbar-thumb { background: #a1a1aa; }
+
+/* Fullscreen video container */
+.group\/video:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.group\/video:fullscreen video {
+  max-width: 100%;
+  max-height: 100%;
+}
